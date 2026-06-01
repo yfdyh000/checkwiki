@@ -27,7 +27,6 @@ use File::Basename;
 use File::Path qw(make_path);
 use File::Spec;
 use POSIX qw(strftime);
-#use MediaWiki::API;
 
 # Windows 控制台 UTF-8 支持
 if ($^O eq 'MSWin32') {
@@ -47,16 +46,23 @@ binmode( STDERR, ':encoding(UTF-8)' );
 ##  全局变量
 ##############################
 
+# 目标模板列表（小写）
+my %TARGET_TEMPLATES = map { lc($_) => 1 } (
+    'footnotessmall', '註腳', '注脚', '參考資料',
+    'reflist', 'references', 'refs',
+    '参考列表', '脚注', '参考文献'
+);
+
 my $dump_dir    = '/public/dumps/public/zhwiki/2*';
 my $output_dir  = '~/public_html/901';  # 默认输出目录
 my $max_results = 100;    # 最大输出结果数，0表示不限制
-my $verbose     = 0;
 my $help        = 0;
 my $toolforge   = 0;       # Toolforge Jobs 模式
 my $incremental = 0;       # 增量写入模式（边扫描边输出）
 my $dump_file_override = '';  # 直接指定dump文件路径
 my $check_article = '';  # 指定要检查的特定条目
 my $tests = 0;           # 测试模式
+my $list_file = '';      # 条目列表文件（txt/csv），仅处理这些条目
 
 GetOptions(
     'dumpdir=s'    => \$dump_dir,
@@ -65,8 +71,8 @@ GetOptions(
     'max-results=i'=> \$max_results,
     'incremental'  => \$incremental,
     'toolforge'    => \$toolforge,
-    'verbose'      => \$verbose,
     'page=s'       => \$check_article,
+    'list=s'       => \$list_file,
     'tests'        => \$tests,
     'help'         => \$help,
 ) or die "参数错误，请使用 --help 查看用法\n";
@@ -76,6 +82,7 @@ utf8::decode($check_article)      if $check_article ne '';
 utf8::decode($dump_dir)           if $dump_dir ne '';
 utf8::decode($dump_file_override) if $dump_file_override ne '';
 utf8::decode($output_dir)         if $output_dir ne '';
+utf8::decode($list_file)          if $list_file ne '';
 
 if ($help) {
     print <<"END_HELP";
@@ -92,6 +99,9 @@ if ($help) {
   --incremental        增量写入模式，边扫描边输出结果，并继续上次的进度。仍需优化
   --toolforge          Toolforge模式：使用项目lib路径，适配K8s作业环境
   --page=<title>       指定要检查的特定条目（使用Live API）
+  --list=<file>        指定条目列表文件（txt或csv），仅处理列表中的条目
+                       txt格式：每行一个条目标题
+                       csv格式：第一列为任意数据，第二列为条目名，首行为表头（自动跳过）
   --tests              运行内置测试用例
   --verbose            显示详细处理信息
   --help               显示此帮助信息
@@ -103,9 +113,8 @@ if ($help) {
 
 901错误说明:
   检测参考文献模板（reflist、註腳、注脚、參考資料、references等）
-  中使用了纯数字匿名参数的情况。
-  例如: {{reflist|3}} 应改为 {{reflist|colwidth=3}}
-  这是因为纯数字匿名参数的语义不明确，可能被误解为列数或其他参数。
+  中指定colwidth为纯数字的情况（含匿名参数1）。
+  例如: {{reflist|2}}
 
 Toolforge Jobs 用法:
   # 方式1: 通过 toolforge jobs 运行
@@ -172,10 +181,44 @@ if ($tests) {
         }
     }
 
-    print "\n=== 测试结果 ===\n";
-    print "总计: $total, 通过: $passed, 失败: " . ($total - $passed) . "\n";
+    print "\n--- get_ref 计数测试 ---\n";
+    my @ref_tests = (
+        { name => "简单ref",          text => "<ref>content</ref>",                              expect => 1 },
+        { name => "带name属性",       text => '<ref name="one">content</ref>',                   expect => 1 },
+        { name => "自闭合ref",        text => '<ref name=":0" />',                                expect => 0 },
+        { name => "自闭合ref(无空格)", text => '<ref name=":0"/>',                                expect => 0 },
+        { name => "多个普通ref",      text => "<ref>a</ref>\n<ref name=\"b\">c</ref>",            expect => 2 },
+        { name => "混合(含自闭合)",   text => '<ref name="a">x</ref><ref name=":0" /><ref>b</ref>', expect => 2 },
+        { name => "非ref标签不计数",  text => "<references />\n<ref>content</ref>",               expect => 1 },
+        { name => "REF大写",          text => "<REF>content</REF>",                              expect => 1 },
+        { name => "空内容ref",        text => "<ref></ref>",                                     expect => 1 },
+        { name => "多属性非自闭合",   text => '<ref name=":0" group="note">text</ref>',           expect => 1 },
+        { name => "跨行属性",         text => "<ref\n name=\"a\">text</ref>",                     expect => 1 },
+        { name => "无ref标签",        text => "纯文本没有引用标签",                              expect => 0 },
+        { name => "reflist含refs参数", text => '{{reflist|refs=<ref name="a">x</ref>}}',          expect => 1 },
+        { name => "复杂的混合场景",   text => '<ref name="a">x</ref> <ref name=":0" /> <ref name="b" group="note">y</ref> <ref name=":1"/>', expect => 2 },
+    );
 
-    exit $total == $passed ? 0 : 1;
+    my $ref_total = scalar(@ref_tests);
+    my $ref_passed = 0;
+    for my $t (@ref_tests) {
+        my $result = get_ref($t->{text});
+        if ($result == $t->{expect}) {
+            print "通过: $t->{name} (计数=$result)\n";
+            $ref_passed++;
+        } else {
+            print "失败: $t->{name} (预期=$t->{expect}, 实际=$result)\n";
+        }
+    }
+
+    print "\n=== 测试结果 ===\n";
+    my $total_all = $total + $ref_total;
+    my $passed_all = $passed + $ref_passed;
+    print "901错误: $total 个测试, $passed 通过, " . ($total - $passed) . " 失败\n";
+    print "get_ref:  $ref_total 个测试, $ref_passed 通过, " . ($ref_total - $ref_passed) . " 失败\n";
+    print "总计:     $total_all 个测试, $passed_all 通过, " . ($total_all - $passed_all) . " 失败\n";
+
+    exit $total_all == $passed_all ? 0 : 1;
 }
 
 ##############################
@@ -187,7 +230,6 @@ if ($toolforge) {
     use lib '/data/project/yfdyh-checkwiki/perl/lib/perl5';
     use lib '/data/project/yfdyh-checkwiki/bin';
 
-    $verbose = 1;  # Toolforge模式下默认显示进度
     print "[Toolforge模式] 启动\n";
 }
 
@@ -236,6 +278,116 @@ sub find_dump_file {
     } @candidates;
 
     return $sorted[0];
+}
+
+###########################################################################
+##  GET_REF
+###########################################################################
+
+sub get_ref {
+
+    my $text = shift;
+    my $ref_count = 0;
+
+    # 匹配所有非自闭合的 <ref> 开标签（含 name= 等属性）
+    # 排除 <ref name=":0" /> 这种自闭合引用（只定义名称不包含内容）
+    # 使用 (?![^>]*\/>) 否定前瞻确保标签不以 /> 结尾
+    # 使用 \b 确保不匹配 <references>、<refname> 等标签
+    # 使用 /i 忽略大小写（XML 标签不区分大小写）
+    while ($text =~ /<ref\b(?![^>]*\/>)[^>]*>/ig) {
+        $ref_count++;
+    }
+
+    return $ref_count;
+}
+
+##############################
+##  加载条目列表（--list 参数）
+##  读取 txt 或 csv 文件，仅处理包含在这些条目中的内容
+##  txt: 每行一个条目标题
+##  csv/tsv: 第二列为条目名，第一列为任意数据，首行为表头（自动跳过）
+##           csv 以逗号分隔，tsv 以制表符分隔
+##############################
+
+sub load_filter_list {
+    my ($filename) = @_;
+
+    my %titles;
+    open( my $fh, '<:encoding(UTF-8)', $filename )
+        or die "无法打开条目列表文件 $filename: $!\n";
+
+    my $is_csv   = ( $filename =~ /\.csv$/i );
+    my $is_tsv   = ( $filename =~ /\.tsv$/i );
+    my $line_num  = 0;    # 非空行计数（含表头）
+    my $processed = 0;    # 成功添加的行数
+    my $skipped   = 0;    # 跳过的行数
+
+    while ( my $line = <$fh> ) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;  # 去除首尾空白
+        if ($line eq '') {
+            #$skipped++;
+            next;
+        }
+
+        $line_num++;
+
+        if ($is_csv || $is_tsv) {
+            if ( $line_num == 1 ) {
+                # 跳过 CSV/TSV 表头（假设第一行是表头）
+                $skipped++;
+                next;
+            }
+            # 取第二列作为条目名
+            my @fields;
+            if ($is_tsv) {
+                # TSV: 以制表符分隔
+                @fields = split /\t/, $line;
+            } else {
+                # CSV: 以逗号分隔（引号包裹的字段可能包含逗号）
+                my $field_buf = '';
+                my $in_quotes = 0;
+                for my $ch (split //, $line) {
+                    if ($ch eq '"') {
+                        $in_quotes = !$in_quotes;
+                    } elsif ($ch eq ',' && !$in_quotes) {
+                        push @fields, $field_buf;
+                        $field_buf = '';
+                    } else {
+                        $field_buf .= $ch;
+                    }
+                }
+                push @fields, $field_buf;  # 最后一列
+            }
+
+            my $title = $fields[1];  # 第二列（索引1）
+            $title =~ s/^\s+|\s+$//g if defined $title;
+            if ( !defined $title || $title eq '' ) {
+                $skipped++;
+                warn "警告: 条目列表第 $line_num 行第二列为空，已跳过: $line\n";
+                next;
+            }
+            # 空格转下划线以匹配 dump 中的条目名格式
+            $title =~ tr/ /_/;
+            $titles{$title} = 1;
+            $processed++;
+        }
+        else {
+            # txt: 整行作为一个条目标题
+            $line =~ tr/ /_/;  # 空格转下划线以匹配 dump 中的条目名格式
+            $titles{$line} = 1;
+            $processed++;
+        }
+    }
+    close($fh);
+
+    my $unique = scalar keys %titles;
+    if ($skipped > 0) {
+        warn "警告: 条目列表 $filename 中共跳过 $skipped 行\n";
+    }
+    print "已加载条目列表: $filename（处理 $processed 行，$unique 个唯一条目）\n";
+
+    return \%titles;
 }
 
 ##############################
@@ -396,16 +548,8 @@ sub parse_templates {
 ##############################
 
 sub check_901_errors {
-    # 目标模板列表（小写）
-    my %target_templates = map { lc($_) => 1 } (
-        'footnotessmall', '註腳', '注脚', '參考資料',
-        'reflist', 'references', 'refs',
-        '参考列表', '脚注', '参考文献'
-    );
-
     my ($title, $text) = @_;
 
-    # $title 参数没有用？？
     my @errors;
 
     my @templates = parse_templates($text);
@@ -414,7 +558,7 @@ sub check_901_errors {
         my $tmpl_name_lc = lc($tmpl->{name});
 
         # 检查是否是目标模板
-        next unless exists $target_templates{$tmpl_name_lc};
+        next unless exists $TARGET_TEMPLATES{$tmpl_name_lc};
 
         # 检查参数
         for my $param (@{$tmpl->{params}}) {
@@ -508,7 +652,7 @@ sub open_incremental_files {
         print "[增量模式] 追加模式写入TSV文件: $tsv_file\n";
     } else {
         open($tsv_fh, '>:encoding(UTF-8)', $tsv_file) or die "无法写入 $tsv_file: $!\n";
-        print $tsv_fh "序号\t条目名\t模板名\t参数名\t参数值\t错误文本\n";
+        print $tsv_fh "序号\t条目名\t模板名\t参数名\t参数值\t错误文本\tref数\n";
     }
 
     # 进度日志 - 追加模式
@@ -528,13 +672,15 @@ sub write_incremental_result {
     my $safe_error = $result->{error_text};
     $safe_error =~ s/\t/ /g;
     $safe_error =~ s/\n/ /g;
-    printf $tsv_fh "%d\t%s\t%s\t%s\t%s\t%s\n",
+    my $ref_count = $result->{ref_count} // 0;
+    printf $tsv_fh "%d\t%s\t%s\t%s\t%s\t%s\t%d\n",
         $idx,
         $safe_title,
         $result->{template},
         $result->{param_name},
         $result->{param_value},
-        $safe_error;
+        $safe_error,
+        $ref_count;
 
     # 定期刷新
     if ($idx % 100 == 0) {
@@ -545,6 +691,28 @@ sub write_incremental_result {
 sub close_incremental_files {
     close($tsv_fh);
     close($progress_fh);
+}
+
+# 写入中间摘要（轻量级，仅基础统计，可被定期调用）
+sub write_interim_summary {
+    my ($out_dir, $artcount, $error_count, $elapsed, $reached_limit, $start_time) = @_;
+
+    my $summary_file = File::Spec->catfile($out_dir, 'checkwiki_901_summary.txt');
+
+    open(my $sum_fh, '>:encoding(UTF-8)', $summary_file) or return;
+    print $sum_fh "=" x 60, "\n";
+    print $sum_fh "CheckWiki 901 错误扫描摘要报告（中间状态）\n";
+    print $sum_fh "=" x 60, "\n\n";
+    print $sum_fh "扫描时间:        " . strftime("%Y-%m-%d %H:%M:%S", localtime($start_time // time())) . "\n";
+    print $sum_fh "扫描条目数:      $artcount\n";
+    print $sum_fh "发现901错误数:   $error_count\n";
+    print $sum_fh "耗时:            ${elapsed}秒\n";
+    print $sum_fh "\n";
+    print $sum_fh "-" x 60, "\n";
+    print $sum_fh "* 注意: 此报告为扫描期间中间状态，结果文件仍在更新中 *\n";
+    print $sum_fh "* 最终报告将在扫描完成后写入完整版本 *\n";
+    print $sum_fh "\n";
+    close($sum_fh);
 }
 
 sub write_progress {
@@ -580,8 +748,10 @@ sub process_article {
 ##############################
 
 sub get_article_from_api {
-# TODO: use MediaWiki::API
     my ($title, $wiki) = @_;
+
+    # 仅在 API 模式下按需加载 MediaWiki::API
+    require MediaWiki::API;
 
     # 默认使用中文维基百科
     $wiki = 'zh.wikipedia.org' unless defined $wiki;
@@ -641,7 +811,8 @@ print "  Dump目录:     $dump_dir\n";
 print "  输出目录:     $output_dir\n";
 print "  最大结果数:   " . ($max_results > 0 ? $max_results : "不限制") . "\n";
 print "  增量写入:     " . ($incremental ? "是" : "否") . "\n";
-print "  Toolforge:    " . ($toolforge ? "是" : "否") . "\n\n";
+print "  Toolforge:    " . ($toolforge ? "是" : "否") . "\n";
+print "  条目列表:     " . ($list_file ne '' ? $list_file : "无") . "\n\n";
 
 # 检查是否使用Live API模式
 my $use_api = 0;
@@ -693,6 +864,13 @@ if (!-w $output_dir) {
     warn "Warning: Output dir $output_dir is not writable, falling back to $fallback\n";
     $output_dir = $fallback;
     mkdir $output_dir unless -d $output_dir;
+}
+
+# 加载条目列表（如指定了 --list）
+my $filter_titles = {};  # 哈希引用，包含要处理的条目标题
+if ($list_file ne '') {
+    $filter_titles = load_filter_list($list_file);
+    print "\n";
 }
 
 # 检查是否安装了 MediaWiki::DumpFile::Pages
@@ -774,6 +952,14 @@ if ($use_api) {
         my $title = $page->title;
         next if $title eq '';
 
+        # 条目列表：跳过不在列表中的条目
+        if (scalar(keys %$filter_titles) > 0) {
+            # dump 中的标题使用下划线，条目列表也已转换, 但比较时用去除下划线的形式
+            my $title_normalized = $title;
+            $title_normalized =~ tr/ /_/;
+            next unless exists $filter_titles->{$title_normalized};
+        }
+
         # 增量模式：跳过已处理的条目
         if ($incremental && $skip_until_title ne '') {
             if ($title ne $skip_until_title) {
@@ -788,9 +974,8 @@ if ($use_api) {
         my $text = $page->revision->text;
         next unless defined $text;
 
-        # 跳过重定向页面
-        my $lc_text = lc($text);
-        if (index($lc_text, '#redirect') > -1) {
+        # 跳过重定向页面（使用 /i 正则避免创建全文小写副本）
+        if ($text =~ /^#redirect\b/i) {
             next;
         }
         $artcount++;
@@ -800,6 +985,9 @@ if ($use_api) {
             if ($incremental) {
                 write_progress($artcount, $error_count, $title);
             }
+            # 定期更新摘要文件
+            my $elapsed_sofar = time() - $time_start;
+            write_interim_summary($output_dir, $artcount, $error_count, $elapsed_sofar, $reached_limit, $time_start);
         }
 
         my @errors = process_article($title, $text);
@@ -808,6 +996,9 @@ if ($use_api) {
         $last_processed_title = $title;
 
         if (@errors) {
+            # 仅在有901错误时计算 <ref> 数量
+            my $ref_count = get_ref($text);
+
             for my $err (@errors) {
                 $error_count++;
 
@@ -817,6 +1008,7 @@ if ($use_api) {
                     param_name  => $err->{param_name},
                     param_value => $err->{param_value},
                     error_text  => $err->{error_text},
+                    ref_count   => $ref_count,
                 };
 
                 if ($incremental) {
@@ -885,16 +1077,22 @@ if ($use_api) {
                         $artcount++;
                         next;
                     } else {
-                        # 找到上次最后处理的条目，跳过它，开始处理下一个
-                        $artcount++;
-                        $skip_until_title = '';
-                        next;
+                            # 找到上次最后处理的条目，跳过它，开始处理下一个
+                            $artcount++;
+                            $skip_until_title = '';
+                            next;
+                        }
                     }
-                }
-                
-                # 跳过重定向页面
-                my $lc_text = lc($current_text);
-                if (index($lc_text, '#redirect') > -1) {
+    
+                    # 条目列表：跳过不在列表中的条目
+                    if (scalar(keys %$filter_titles) > 0) {
+                        my $title_normalized = $current_title;
+                        $title_normalized =~ tr/ /_/;
+                        next unless exists $filter_titles->{$title_normalized};
+                    }
+    
+                    # 跳过重定向页面（使用 /i 正则避免创建全文小写副本）
+                if ($current_text =~ /^#redirect\b/i) {
                     next;
                 }
                 $artcount++;
@@ -904,6 +1102,9 @@ if ($use_api) {
                     if ($incremental) {
                         write_progress($artcount, $error_count, $current_title);
                     }
+                    # 定期更新摘要文件
+                    my $elapsed_sofar = time() - $time_start;
+                    write_interim_summary($output_dir, $artcount, $error_count, $elapsed_sofar, $reached_limit, $time_start);
                 }
 
                 my @errors = process_article($current_title, $current_text);
@@ -912,6 +1113,9 @@ if ($use_api) {
                 $last_processed_title = $current_title;
 
                 if (@errors) {
+                    # 仅在有901错误时计算 <ref> 数量
+                    my $ref_count = get_ref($current_text);
+
                     for my $err (@errors) {
                         $error_count++;
 
@@ -921,6 +1125,7 @@ if ($use_api) {
                             param_name  => $err->{param_name},
                             param_value => $err->{param_value},
                             error_text  => $err->{error_text},
+                            ref_count   => $ref_count,
                         };
 
                         if ($incremental) {
@@ -962,13 +1167,20 @@ if ($use_api) {
             }
         }
 
-        if ($in_text) {
+        # 只对条目命名空间（ns=0）累加文本内容
+        # 非条目页面（讨论页、用户页等）的文本无需处理，跳过以节省大量字符串操作
+        if ($in_text && ($current_ns == 0 || $current_ns == -1)) {
             if (/<\/text>/) {
                 $in_text = 0;
                 s/<\/text>.*//s;
                 $current_text .= $_;
             } else {
                 $current_text .= $_;
+            }
+        } elsif ($in_text) {
+            # 非条目页面：仅检测结束标签，不累加文本
+            if (/<\/text>/) {
+                $in_text = 0;
             }
         }
     }
@@ -1004,7 +1216,7 @@ if ($incremental) {
     print "正在写入TSV结果: $tsv_file\n";
 
     open(my $tsv_fh_out, '>:encoding(UTF-8)', $tsv_file) or die "无法写入 $tsv_file: $!\n";
-    print $tsv_fh_out "序号\t条目名\t模板名\t参数名\t参数值\t错误文本\n";
+    print $tsv_fh_out "序号\t条目名\t模板名\t参数名\t参数值\t错误文本\tref数\n";
     my $idx = 0;
     for my $r (@all_results) {
         $idx++;
@@ -1014,13 +1226,15 @@ if ($incremental) {
         my $safe_error = $r->{error_text};
         $safe_error =~ s/\t/ /g;
         $safe_error =~ s/\n/ /g;
-        printf $tsv_fh_out "%d\t%s\t%s\t%s\t%s\t%s\n",
+        my $ref_count = $r->{ref_count} // 0;
+        printf $tsv_fh_out "%d\t%s\t%s\t%s\t%s\t%s\t%d\n",
             $idx,
             $safe_title,
             $r->{template},
             $r->{param_name},
             $r->{param_value},
-            $safe_error;
+            $safe_error,
+            $ref_count;
     }
     close($tsv_fh_out);
 }
@@ -1041,13 +1255,18 @@ print $sum_fh "发现901错误数:   $error_count\n";
 print $sum_fh "耗时:            $elapsed 秒\n";
 print $sum_fh "最大结果限制:    " . ($max_results > 0 ? $max_results : "无限制") . "\n";
 print $sum_fh "达到限制:        " . ($reached_limit ? "是" : "否") . "\n";
-print $sum_fh "增量写入模式:    " . ($incremental ? "是" : "否") . "\n\n";
+print $sum_fh "增量写入模式:    " . ($incremental ? "是" : "否") . "\n";
+print $sum_fh "条目列表文件:    " . ($list_file ne '' ? $list_file : "无") . "\n";
+if ($list_file ne '') {
+    print $sum_fh "条目列表条目数:  " . scalar(keys %$filter_titles) . "\n";
+}
+print $sum_fh "\n";
 
 print $sum_fh "-" x 60, "\n";
 print $sum_fh "901错误说明:\n";
 print $sum_fh "  检测参考文献模板（reflist、註腳、注脚、參考資料、references等）\n";
-print $sum_fh "  中使用了纯数字匿名参数的情况。\n";
-print $sum_fh "  例如: {{reflist|3}} 应改为 {{reflist|colwidth=3}}\n";
+print $sum_fh "  中指定colwidth为纯数字的情况（含匿名参数1）。\n";
+print $sum_fh "  例如: {{reflist|2}}\n";
 print $sum_fh "-" x 60, "\n\n";
 
 # 按模板统计
